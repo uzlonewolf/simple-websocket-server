@@ -31,7 +31,7 @@ def _check_unicode(val):
     if VER >= 3:
         return isinstance(val, str)
     else:
-        return isinstance(val, unicode)
+        return isinstance(val, basestring)
 
 class HTTPRequest(BaseHTTPRequestHandler):
    def __init__(self, request_text):
@@ -51,6 +51,15 @@ HANDSHAKE_STR = (
    "Upgrade: WebSocket\r\n"
    "Connection: Upgrade\r\n"
    "Sec-WebSocket-Accept: %(acceptstr)s\r\n\r\n"
+)
+
+FAILED_HANDSHAKE_STR = (
+   "HTTP/1.1 426 Upgrade Required\r\n"
+   "Upgrade: WebSocket\r\n"
+   "Connection: Upgrade\r\n"
+   "Sec-WebSocket-Version: 13\r\n"
+   "Content-Type: text/plain\r\n\r\n"
+   "This service requires use of the WebSocket protocol\r\n"
 )
 
 GUID_STR = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -267,6 +276,9 @@ class WebSocket(object):
                   self.handshaked = True
                   self.handleConnected()
                except Exception as e:
+                  hStr = FAILED_HANDSHAKE_STR
+                  self._sendBuffer(hStr.encode('ascii'), True)
+                  self.client.close()
                   raise Exception('handshake failed: %s', str(e))
 
       # else do normal data
@@ -575,9 +587,19 @@ class WebSocket(object):
 class SimpleWebSocketServer(object):
    def __init__(self, host, port, websocketclass, selectInterval = 0.1):
       self.websocketclass = websocketclass
-      self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+      if (host == ''):
+         host = None
+
+      if host is None:
+         fam = socket.AF_INET6
+      else:
+         fam = 0
+
+      hostInfo = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_PASSIVE)
+      self.serversocket = socket.socket(hostInfo[0][0], hostInfo[0][1], hostInfo[0][2])
       self.serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      self.serversocket.bind((host, port))
+      self.serversocket.bind(hostInfo[0][4])
       self.serversocket.listen(5)
       self.selectInterval = selectInterval
       self.connections = {}
@@ -614,10 +636,7 @@ class SimpleWebSocketServer(object):
          if client.sendq:
             writers.append(fileno)
 
-      if self.selectInterval:
-         rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
-      else:
-         rList, wList, xList = select(self.listeners, writers, self.listeners)
+      rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
 
       for ready in wList:
          client = self.connections[ready]
@@ -679,14 +698,17 @@ class SimpleWebSocketServer(object):
 
 class SimpleSSLWebSocketServer(SimpleWebSocketServer):
 
-   def __init__(self, host, port, websocketclass, certfile,
-                keyfile, version = ssl.PROTOCOL_TLSv1, selectInterval = 0.1):
+   def __init__(self, host, port, websocketclass, certfile = None,
+                keyfile = None, version = ssl.PROTOCOL_TLSv1, selectInterval = 0.1, ssl_context = None):
 
       SimpleWebSocketServer.__init__(self, host, port,
                                         websocketclass, selectInterval)
 
-      self.context = ssl.SSLContext(version)
-      self.context.load_cert_chain(certfile, keyfile)
+      if ssl_context is None:
+         self.context = ssl.SSLContext(version)
+         self.context.load_cert_chain(certfile, keyfile)
+      else:
+         self.context = ssl_context
 
    def close(self):
       super(SimpleSSLWebSocketServer, self).close()
