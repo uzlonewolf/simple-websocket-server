@@ -638,10 +638,29 @@ class SimpleWebSocketServer(object):
 
    def close(self):
       self.serversocket.close()
+      self.listeners.remove(self.serversocket)
+      self.serversocket = None
 
-      for desc, conn in self.connections.items():
-         conn.close()
-         self._handleClose(conn)
+      for desc, client in self.connections.items():
+         # queue the CLOSE command
+         client.close()
+
+      for listener in self.listeners:
+         if listener not in self.connections:
+            # SSL handshake not finished yet
+            listener.close()
+      self.listeners = []
+
+      # send the queued CLOSE command
+      self.selectInterval = 0.1
+      limit = 5
+      while self.connections and limit:
+         self.serveonce(closing=True)
+         limit -= 1
+
+      for desc, client in self.connections.items():
+         # close any hung clients (most clients will be closed inside serveonce())
+         self._handleClose(client)
 
    def _handleClose(self, client):
       client.client.close()
@@ -652,10 +671,14 @@ class SimpleWebSocketServer(object):
          except:
             pass
 
-   def serveonce(self):
+   def serveonce(self, closing=False):
       writers = self.needDecorateWriters + [fileno for fileno in self.connections if self.connections[fileno].sendq]
 
       rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
+
+      # self.close() may be called from a different thread
+      if (not self.serversocket) and (not closing):
+         return
 
       for ready in wList:
          if ready in self.needDecorateWriters:
@@ -667,7 +690,6 @@ class SimpleWebSocketServer(object):
             except ssl.SSLWantWriteError:
                continue
             except Exception as n:
-               print('write exception:', n)
                ready.close()
                self.listeners.remove(ready)
             else:
@@ -693,7 +715,8 @@ class SimpleWebSocketServer(object):
          except Exception as n:
             self._handleClose(client)
             del self.connections[ready]
-            self.listeners.remove(ready)
+            if ready in self.listeners:
+               self.listeners.remove(ready)
 
       for ready in rList:
          if ready == self.serversocket:
@@ -732,6 +755,7 @@ class SimpleWebSocketServer(object):
 
          if ready not in self.connections:
             continue
+
          client = self.connections[ready]
          try:
             client._handleData()
@@ -753,7 +777,7 @@ class SimpleWebSocketServer(object):
             self.listeners.remove(failed)
 
    def serveforever(self):
-      while True:
+      while self.serversocket:
          self.serveonce()
 
 class SimpleSSLWebSocketServer(SimpleWebSocketServer):
