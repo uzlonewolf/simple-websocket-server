@@ -623,10 +623,15 @@ class SimpleWebSocketServer(object):
       self.serversocket.listen(5)
       self.selectInterval = selectInterval
       self.connections = {}
+      self.needDecorate = {}
+      self.needDecorateWriters = []
       self.listeners = [self.serversocket]
 
    def _decorateSocket(self, sock):
       return sock
+
+   def _handshakeSocket(self, sock):
+      pass
 
    def _constructWebSocket(self, sock, address):
       return self.websocketclass(self, sock, address)
@@ -648,28 +653,42 @@ class SimpleWebSocketServer(object):
             pass
 
    def serveonce(self):
-      writers = []
-      for fileno in self.listeners:
-         if fileno == self.serversocket:
-            continue
-         client = self.connections[fileno]
-         if client.sendq:
-            writers.append(fileno)
+      writers = self.needDecorateWriters + [fileno for fileno in self.connections if self.connections[fileno].sendq]
 
       rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
 
       for ready in wList:
+         if ready in self.needDecorateWriters:
+            try:
+               self._handshakeSocket(ready)
+            except ssl.SSLWantReadError:
+               self.needDecorateWriters.remove(ready)
+               continue
+            except ssl.SSLWantWriteError:
+               continue
+            except Exception as n:
+               print('write exception:', n)
+               ready.close()
+               self.listeners.remove(ready)
+            else:
+               self.connections[ready] = self._constructWebSocket(ready, self.needDecorate[ready])
+
+            # if we're here either the handshake finished or there was an unhandled exception
+            self.needDecorateWriters.remove(ready)
+            del self.needDecorate[ready]
+            continue
+
          client = self.connections[ready]
          try:
             while client.sendq:
                opcode, payload = client.sendq.popleft()
                remaining = client._sendBuffer(payload)
                if remaining is not None:
-                   client.sendq.appendleft((opcode, remaining))
-                   break
+                  client.sendq.appendleft((opcode, remaining))
+                  break
                else:
-                   if opcode == CLOSE:
-                      raise Exception('received client close')
+                  if opcode == CLOSE:
+                     raise Exception('received client close')
 
          except Exception as n:
             self._handleClose(client)
@@ -681,24 +700,45 @@ class SimpleWebSocketServer(object):
             sock = None
             try:
                sock, address = self.serversocket.accept()
+               sock.settimeout(30)
                newsock = self._decorateSocket(sock)
-               newsock.setblocking(0)
-               fileno = newsock.fileno()
-               self.connections[fileno] = self._constructWebSocket(newsock, address)
-               self.listeners.append(fileno)
+               newsock.setblocking(False)
+               self.needDecorate[newsock] = address
+               self.listeners.append(newsock)
             except Exception as n:
                if sock is not None:
                   sock.close()
-         else:
-            if ready not in self.connections:
-                continue
-            client = self.connections[ready]
+            continue
+
+         if ready in self.needDecorate:
             try:
-               client._handleData()
+               self._handshakeSocket(ready)
+            except ssl.SSLWantReadError:
+               continue
+            except ssl.SSLWantWriteError:
+               self.needDecorateWriters.append(ready)
+               continue
             except Exception as n:
-               self._handleClose(client)
-               del self.connections[ready]
+               ready.close()
                self.listeners.remove(ready)
+            else:
+               self.connections[ready] = self._constructWebSocket(ready, self.needDecorate[ready])
+
+            # if we're here either the handshake finished or there was an unhandled exception
+            if ready in self.needDecorateWriters:
+               self.needDecorateWriters.remove(ready)
+            del self.needDecorate[ready]
+            continue
+
+         if ready not in self.connections:
+            continue
+         client = self.connections[ready]
+         try:
+            client._handleData()
+         except Exception as n:
+            self._handleClose(client)
+            del self.connections[ready]
+            self.listeners.remove(ready)
 
       for failed in xList:
          if failed == self.serversocket:
@@ -734,8 +774,11 @@ class SimpleSSLWebSocketServer(SimpleWebSocketServer):
       super(SimpleSSLWebSocketServer, self).close()
 
    def _decorateSocket(self, sock):
-      sslsock = self.context.wrap_socket(sock, server_side=True)
+      sslsock = self.context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
       return sslsock
+
+   def _handshakeSocket(self, sock):
+      sock.do_handshake()
 
    def _constructWebSocket(self, sock, address):
       ws = self.websocketclass(self, sock, address)
