@@ -637,9 +637,11 @@ class SimpleWebSocketServer(object):
       return self.websocketclass(self, sock, address)
 
    def close(self):
-      self.serversocket.close()
-      self.listeners.remove(self.serversocket)
+      serversocket = self.serversocket
       self.serversocket = None
+      self.listeners.remove(serversocket)
+      serversocket.close()
+      serversocket = None
 
       for desc, client in self.connections.items():
          # queue the CLOSE command
